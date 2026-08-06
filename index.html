@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Schwarzschild Ray Tracer</title>
+<style>
+  :root {
+    --ink:    #0f0d09;
+    --panel:  rgba(15, 13, 9, 0.82);
+    --text:   #c8bfa8;
+    --dim:    #6e6552;
+    --accent: #e0a34c;
+    --line:   #2a2620;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; background: #000; }
+  body {
+    font-family: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    color: var(--text);
+  }
+  #gl {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    display: block; cursor: grab; touch-action: none; outline: none;
+  }
+  #gl:active { cursor: grabbing; }
+  #gl:focus-visible { box-shadow: inset 0 0 0 2px var(--accent); }
+
+  /* FITS-style header: live state as KEY = VALUE / comment */
+  #hud {
+    position: absolute; top: 14px; left: 16px;
+    background: var(--panel); border: 1px solid var(--line);
+    padding: 10px 14px; font-size: 12px; line-height: 1.75;
+    white-space: pre; pointer-events: none; user-select: none;
+  }
+  #hud b { color: var(--accent); font-weight: 400; }
+  #hud i { color: var(--dim); font-style: normal; }
+
+  #bar {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+    background: var(--panel); border-top: 1px solid var(--line);
+    padding: 10px 16px; font-size: 11px;
+  }
+  .ctl { display: flex; align-items: center; gap: 7px; }
+  .ctl label {
+    color: var(--dim); text-transform: uppercase; letter-spacing: 0.09em;
+  }
+  .ctl output { color: var(--text); min-width: 4ch; text-align: right; }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none;
+    width: 90px; height: 2px; background: var(--line); outline: none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 11px; height: 11px; border-radius: 50%;
+    background: var(--accent); border: none; cursor: pointer;
+  }
+  input[type=range]::-moz-range-thumb {
+    width: 11px; height: 11px; border-radius: 50%;
+    background: var(--accent); border: none; cursor: pointer;
+  }
+  input[type=range]:focus-visible { box-shadow: 0 0 0 2px var(--accent); }
+  button {
+    font: inherit; color: var(--text);
+    background: none; border: 1px solid var(--line);
+    padding: 4px 10px; cursor: pointer;
+    text-transform: uppercase; letter-spacing: 0.09em; font-size: 11px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); }
+  #help {
+    margin-left: auto; color: var(--dim); letter-spacing: 0.04em;
+  }
+  #err {
+    position: absolute; inset: 0; display: none;
+    place-content: center; text-align: center;
+    padding: 40px; font-size: 14px; line-height: 2;
+  }
+  @media (max-width: 760px) {
+    #hud { font-size: 10px; padding: 8px 10px; }
+    #help { display: none; }
+  }
+</style>
+</head>
+<body>
+<canvas id="gl" tabindex="0" aria-label="Black hole view. Drag to orbit, scroll to move closer or farther, arrow keys to orbit."></canvas>
+<div id="hud" aria-hidden="true"></div>
+<div id="err">WebGL2 is unavailable in this browser.<br>
+On macOS, use Safari 15 or later, or any current Chrome or Firefox.</div>
+
+<div id="bar">
+  <span class="ctl"><label for="fov">fov</label>
+    <input id="fov" type="range" min="25" max="80" step="1" value="45"><output id="fovv">45&deg;</output></span>
+  <span class="ctl"><label for="exp">exposure</label>
+    <input id="exp" type="range" min="0.15" max="1.6" step="0.05" value="0.65"><output id="expv">0.65</output></span>
+  <span class="ctl"><label for="stp">steps</label>
+    <input id="stp" type="range" min="128" max="1024" step="64" value="512"><output id="stpv">512</output></span>
+  <span class="ctl"><label for="scl">scale</label>
+    <input id="scl" type="range" min="0.35" max="1" step="0.05" value="0.55"><output id="sclv">0.55</output></span>
+  <button id="gr"   aria-pressed="true">relativity on</button>
+  <button id="spin" aria-pressed="false">disk &#8635;</button>
+  <button id="anim" aria-pressed="true">animating</button>
+  <button id="reset">reset view</button>
+  <button id="shot">save png</button>
+  <span id="help">drag orbit &middot; scroll dolly &middot; arrows/+/&minus; keys</span>
+</div>
+
+<script>
+"use strict";
+
+const FRAG = `#version 300 es
+precision highp float;
+precision highp int;
+
+// Schwarzschild null geodesics, planar Binet reduction: d2u/dphi2 = 3u^2 - u,
+// u = 1/r, G = c = M = 1. Same physics as the CPU-validated reference.
+
+out vec4 fragColor;
+
+uniform vec2  uRes;
+uniform vec3  uCamPos, uCamFwd, uCamRight, uCamUp;
+uniform float uTanHalfFov, uAspect, uRcam;
+uniform float uRin, uRout, uExposure, uTime, uSpin;
+uniform float uUEscape;
+uniform int   uMaxSteps;
+uniform int   uGRShade;      // 0 = emissivity only, 1 = full redshift + beaming
+
+const float U_HORIZON = 1.0 / (2.0 * 1.0001);
+
+// ---------------------------------------------------------------- hash / stars
+
+uint hashu(uint x) {
+    x ^= x >> 16u; x *= 0x7feb352du;
+    x ^= x >> 15u; x *= 0x846ca68bu;
+    x ^= x >> 16u; return x;
+}
+float rnd(uint s) { return float(hashu(s) & 0x00ffffffu) * (1.0 / 16777216.0); }
+
+vec3 starfield(vec3 d) {
+    const int NA = 1400, NC = 700;
+    float a = (atan(d.y, d.x) + 3.14159265) * (1.0 / 6.2831853);
+    float c = (d.z + 1.0) * 0.5;
+    float fa = a * float(NA), fc = c * float(NC);
+    int ia = int(floor(fa)), ic = int(floor(fc));
+
+    vec3 acc = vec3(0.0);
+    for (int dj = -1; dj <= 1; ++dj) {
+        int jc = ic + dj;
+        if (jc < 0 || jc >= NC) continue;
+        for (int di = -1; di <= 1; ++di) {
+            int ja = (ia + di + NA) % NA;
+            uint seed = uint(ja * 73856093) ^ uint(jc * 19349663);
+            if (rnd(seed) > 0.055) continue;
+
+            float sx = float(ja) + rnd(seed ^ 0xa511e9b3u);
+            float sy = float(jc) + rnd(seed ^ 0x0e5c1f2du);
+            float dx = fa - sx, dy = fc - sy;
+            if (dx >  float(NA) * 0.5) dx -= float(NA);
+            if (dx < -float(NA) * 0.5) dx += float(NA);
+            float d2 = dx * dx + dy * dy;
+
+            float mag  = rnd(seed ^ 0x1b873593u);
+            float lum  = 0.02 + 1.6 * mag * mag * mag * mag * mag;
+            float sig2 = 0.16 + 0.5 * lum;
+            float prof = exp(-d2 / sig2);
+
+            float t = rnd(seed ^ 0x27d4eb2fu);
+            vec3 col = (t > 0.82) ? vec3(0.72, 0.80, 1.00)
+                                  : vec3(1.00, 0.78 + 0.20 * t, 0.55 + 0.45 * t);
+            acc += col * (lum * prof);
+        }
+    }
+    acc += vec3(0.012, 0.011, 0.016) * exp(-abs(d.y) * 6.0);
+    return acc;
+}
+
+// ---------------------------------------------------------------- integrator
+
+void deriv(float u, float du, out float fu, out float fdu) {
+    fu = du; fdu = 3.0 * u * u - u;
+}
+
+void rk4(inout float u, inout float du, float h) {
+    float a1, b1, a2, b2, a3, b3, a4, b4;
+    deriv(u,               du,               a1, b1);
+    deriv(u + 0.5*h*a1,    du + 0.5*h*b1,    a2, b2);
+    deriv(u + 0.5*h*a2,    du + 0.5*h*b2,    a3, b3);
+    deriv(u + h*a3,        du + h*b3,        a4, b4);
+    u  += (h / 6.0) * (a1 + 2.0*a2 + 2.0*a3 + a4);
+    du += (h / 6.0) * (b1 + 2.0*b2 + 2.0*b3 + b4);
+}
+
+float stepSize(float u, float du) {
+    float h = 0.05 / (1.0 + 30.0 * u * u);      // refine near the photon sphere
+    h = min(h, 0.3 * abs(u) / (abs(du) + 1.0e-30));
+    return max(h, 1.0e-6);
+}
+
+// ---------------------------------------------------------------- shading
+
+float redshift(float rEm, float LzE) {
+    float omega = uSpin * inversesqrt(rEm * rEm * rEm);   // Keplerian
+    float num = sqrt(max(1.0 - 3.0 / rEm, 1.0e-6));
+    float den = sqrt(max(1.0 - 2.0 / uRcam, 1.0e-6)) * (1.0 - omega * LzE);
+    den = (abs(den) < 1.0e-4) ? sign(den) * 1.0e-4 : den;
+    return num / den;
+}
+
+float emissivity(float r) {
+    float x = uRin / r;
+    float f = x * x * x * (1.0 - sqrt(x));
+    float xp = (6.0 / 7.0) * (6.0 / 7.0);                 // argmax of x^3(1-sqrt x)
+    return f / (xp * xp * xp * (1.0 - sqrt(xp)));
+}
+
+vec3 tempColour(float t) {
+    // Knots placed against the measured T distribution: the receding side
+    // (p05..p50 of T) stays deep orange, only the beamed approaching side
+    // crosses into white-blue. Wide orange span is what keeps the disk from
+    // rendering beige-gray after Reinhard.
+    t = clamp(t, 0.0, 1.0);
+    vec3 deep = vec3(0.95, 0.18, 0.02);
+    vec3 org  = vec3(1.00, 0.45, 0.08);
+    vec3 amb  = vec3(1.00, 0.72, 0.30);
+    vec3 hot  = vec3(0.88, 0.90, 1.00);
+    if (t < 0.30) return mix(deep, org, t / 0.30);
+    if (t < 0.65) return mix(org, amb, (t - 0.30) / 0.35);
+    return mix(amb, hot, (t - 0.65) / 0.35);
+}
+
+vec3 shadeDisk(float r, float az, float LzE) {
+    float g  = (uGRShade == 1) ? redshift(r, LzE) : 1.0;
+    float em = emissivity(r);
+    // g*em^(1/4) spans 0.56..1.11 (5th..95th pct, measured); remap so the
+    // median 0.73 sits at the amber part of the ramp, not the pale middle
+    float T  = (pow(max(em, 1.0e-6), 0.25) * g - 0.40) * 1.15;
+    // pattern advected at the local Keplerian rate: differential rotation
+    float pat  = az - uSpin * inversesqrt(r * r * r) * uTime;
+    float turb = 0.72 + 0.28 * sin(11.0 * log(r) + 5.0 * pat)
+                      * (0.65 + 0.35 * sin(27.0 * log(r) - 9.0 * pat));
+    float g2 = g * g;
+    return tempColour(T) * (em * g2 * g2 * turb * uExposure);
+}
+
+// ---------------------------------------------------------------- trace
+
+vec3 trace(vec3 P, vec3 D) {
+    float r0 = length(P);
+    vec3  n  = cross(P, D);
+    float nn = length(n);
+    if (nn < 1.0e-7 * r0)
+        return (dot(P, D) < 0.0) ? vec3(0.0) : starfield(normalize(D));
+    n /= nn;
+
+    vec3 e1 = P / r0;
+    vec3 e2 = normalize(cross(n, e1));
+    float dr = dot(D, e1);
+    float dt = dot(D, e2);
+
+    float lapse = sqrt(max(0.0, 1.0 - 2.0 / r0));   // static-observer frame
+    float u  = 1.0 / r0;
+    float du = -lapse * dr / (r0 * dt);
+
+    float b   = inversesqrt(max(du*du + u*u - 2.0*u*u*u, 1.0e-30));
+    float LzE = -b * n.z;    // traced ray runs backward along the photon path
+
+    float phi = 0.0;
+    float sPrev = e1.z;
+
+    for (int i = 0; i < 1024; ++i) {
+        if (i >= uMaxSteps) break;
+        float up = u, dup = du, phip = phi;
+
+        float h = stepSize(u, du);
+        rk4(u, du, h);
+        phi += h;
+
+        if (u < uUEscape) {                          // escaped, u may be < 0
+            vec3 rad = cos(phip) * e1 + sin(phip) * e2;
+            vec3 tng = -sin(phip) * e1 + cos(phip) * e2;
+            vec3 vel = -(dup / (up * up)) * rad + (1.0 / up) * tng;
+            return starfield(normalize(vel));
+        }
+
+        float s = cos(phi) * e1.z + sin(phi) * e2.z;
+        if (sPrev * s < 0.0) {
+            float t  = sPrev / (sPrev - s);
+            float t2 = t * t, t3 = t2 * t;
+            float uc = ( 2.0*t3 - 3.0*t2 + 1.0) * up
+                     + (     t3 - 2.0*t2 + t  ) * (h * dup)
+                     + (-2.0*t3 + 3.0*t2      ) * u
+                     + (     t3 -     t2      ) * (h * du);
+            float rc = 1.0 / max(uc, 1.0e-20);
+            if (rc > uRin && rc < uRout) {
+                float phic = phip + t * h;
+                vec3 pos = rc * (cos(phic) * e1 + sin(phic) * e2);
+                return shadeDisk(rc, atan(pos.y, pos.x), LzE);
+            }
+        }
+        sPrev = s;
+
+        if (u > U_HORIZON) return vec3(0.0);
+    }
+    return vec3(0.0);                                // step budget: near b_c
+}
+
+void main() {
+    float sx = 2.0 * gl_FragCoord.x / uRes.x - 1.0;
+    float sy = 2.0 * gl_FragCoord.y / uRes.y - 1.0;
+    vec3 D = normalize(uCamFwd
+                     + uCamRight * (sx * uTanHalfFov * uAspect)
+                     + uCamUp    * (sy * uTanHalfFov));
+    vec3 c = trace(uCamPos, D);
+    c = c / (1.0 + c);                               // Reinhard
+    fragColor = vec4(pow(c, vec3(1.0 / 2.2)), 1.0);
+}
+`;
+
+const VERT = `#version 300 es
+layout(location=0) in vec2 p;
+void main(){ gl_Position = vec4(p, 0.0, 1.0); }`;
+
+const canvas = document.getElementById("gl");
+const gl = canvas.getContext("webgl2", { antialias: false });
+if (!gl) {
+  document.getElementById("err").style.display = "grid";
+  document.getElementById("bar").style.display = "none";
+  document.getElementById("hud").style.display = "none";
+  throw new Error("webgl2 unavailable");
+}
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, compile(gl.VERTEX_SHADER, VERT));
+gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FRAG));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+  throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+const U = {};
+for (const n of ["uRes","uCamPos","uCamFwd","uCamRight","uCamUp","uTanHalfFov",
+                 "uAspect","uRcam","uRin","uRout","uExposure","uTime","uSpin",
+                 "uUEscape","uMaxSteps","uGRShade"])
+  U[n] = gl.getUniformLocation(prog, n);
+
+// ------------------------------------------------------------------ state
+
+const DEF = { r: 30.0, incl: 85.0, az: 0.0 };
+const state = {
+  r: DEF.r, incl: DEF.incl, az: DEF.az,
+  fov: 45, exposure: 0.65, steps: 512, scale: 0.55,
+  spin: 1.0, gr: 1, playing: !matchMedia("(prefers-reduced-motion: reduce)").matches,
+  time: 0
+};
+
+const BC = 3 * Math.sqrt(3);        // critical impact parameter, units of M
+
+function camera() {
+  const th = state.incl * Math.PI / 180, ph = state.az * Math.PI / 180;
+  const pos = [state.r * Math.sin(th) * Math.cos(ph),
+               state.r * Math.sin(th) * Math.sin(ph),
+               state.r * Math.cos(th)];
+  const L = Math.hypot(...pos);
+  const fwd = pos.map(v => -v / L);
+  let right = [fwd[1] * 1 - fwd[2] * 0, fwd[2] * 0 - fwd[0] * 1, fwd[0] * 0 - fwd[1] * 0];
+  const rl = Math.hypot(...right);
+  right = right.map(v => v / rl);
+  const up = [right[1]*fwd[2] - right[2]*fwd[1],
+              right[2]*fwd[0] - right[0]*fwd[2],
+              right[0]*fwd[1] - right[1]*fwd[0]];
+  return { pos, fwd, right, up };
+}
+
+// ------------------------------------------------------------------ render
+
+let fps = 0, lastT = performance.now(), frames = 0, fpsT = lastT;
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.max(1, Math.round(canvas.clientWidth  * dpr * state.scale));
+  const h = Math.max(1, Math.round(canvas.clientHeight * dpr * state.scale));
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w; canvas.height = h;
+    gl.viewport(0, 0, w, h);
+  }
+}
+
+function draw() {
+  resize();
+  const cam = camera();
+  gl.uniform2f(U.uRes, canvas.width, canvas.height);
+  gl.uniform3fv(U.uCamPos, cam.pos);
+  gl.uniform3fv(U.uCamFwd, cam.fwd);
+  gl.uniform3fv(U.uCamRight, cam.right);
+  gl.uniform3fv(U.uCamUp, cam.up);
+  gl.uniform1f(U.uTanHalfFov, Math.tan(state.fov * Math.PI / 360));
+  gl.uniform1f(U.uAspect, canvas.width / canvas.height);
+  gl.uniform1f(U.uRcam, state.r);
+  gl.uniform1f(U.uRin, 6.0);
+  gl.uniform1f(U.uRout, 20.0);
+  gl.uniform1f(U.uExposure, state.exposure);
+  gl.uniform1f(U.uTime, state.time);
+  gl.uniform1f(U.uSpin, state.spin);
+  gl.uniform1f(U.uUEscape, 1.0 / Math.max(4 * state.r, 400));
+  gl.uniform1i(U.uMaxSteps, state.steps);
+  gl.uniform1i(U.uGRShade, state.gr);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+function hud() {
+  const arg = Math.min(1, BC * Math.sqrt(Math.max(0, 1 - 2 / state.r)) / state.r);
+  const shadow = 2 * Math.asin(arg) * 180 / Math.PI;
+  const mpix = canvas.width * canvas.height * fps / 1e6;
+  const pad = (k, v, c) =>
+    `<b>${k.padEnd(8)}</b>= ${String(v).padStart(9)} <i>/ ${c}</i>`;
+  document.getElementById("hud").innerHTML = [
+    pad("RCAM",   state.r.toFixed(1),            "camera radius [M]"),
+    pad("INCL",   state.incl.toFixed(1),         "inclination [deg]"),
+    pad("AZ",     ((state.az % 360 + 360) % 360).toFixed(1), "azimuth [deg]"),
+    pad("SHADOW", shadow.toFixed(2),             "shadow diameter [deg]"),
+    pad("FPS",    fps.toFixed(0),                "frames per second"),
+    pad("THRPT",  mpix.toFixed(1),               "megapixels per second"),
+    pad("RES",    canvas.width + "x" + canvas.height, "render resolution")
+  ].join("\n");
+}
+
+function loop(t) {
+  const dt = Math.min(0.1, (t - lastT) / 1000);
+  lastT = t;
+  if (state.playing) state.time += dt;
+  draw();
+  frames++;
+  if (t - fpsT > 500) {
+    fps = frames * 1000 / (t - fpsT);
+    frames = 0; fpsT = t;
+  }
+  hud();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ------------------------------------------------------------------ input
+
+let dragging = false, px = 0, py = 0;
+canvas.addEventListener("pointerdown", e => {
+  dragging = true; px = e.clientX; py = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+});
+canvas.addEventListener("pointermove", e => {
+  if (!dragging) return;
+  state.az   -= (e.clientX - px) * 0.25;
+  state.incl -= (e.clientY - py) * 0.25;
+  state.incl = Math.min(178, Math.max(2, state.incl));
+  px = e.clientX; py = e.clientY;
+});
+canvas.addEventListener("pointerup", () => { dragging = false; });
+canvas.addEventListener("wheel", e => {
+  e.preventDefault();
+  state.r = Math.min(150, Math.max(4.6, state.r * Math.exp(e.deltaY * 0.0012)));
+}, { passive: false });
+canvas.addEventListener("keydown", e => {
+  const k = e.key;
+  if (k === "ArrowLeft")  state.az -= 3;
+  else if (k === "ArrowRight") state.az += 3;
+  else if (k === "ArrowUp")   state.incl = Math.max(2, state.incl - 3);
+  else if (k === "ArrowDown") state.incl = Math.min(178, state.incl + 3);
+  else if (k === "+" || k === "=") state.r = Math.max(4.6, state.r * 0.94);
+  else if (k === "-")  state.r = Math.min(150, state.r / 0.94);
+  else return;
+  e.preventDefault();
+});
+
+// ------------------------------------------------------------------ controls
+
+function slider(id, out, fmt, set) {
+  const el = document.getElementById(id), o = document.getElementById(out);
+  el.addEventListener("input", () => { set(parseFloat(el.value)); o.innerHTML = fmt(el.value); });
+}
+slider("fov", "fovv", v => v + "&deg;",       v => state.fov = v);
+slider("exp", "expv", v => (+v).toFixed(2),   v => state.exposure = v);
+slider("stp", "stpv", v => v,                 v => state.steps = v | 0);
+slider("scl", "sclv", v => (+v).toFixed(2),   v => state.scale = v);
+
+function toggle(id, get, set, label) {
+  const b = document.getElementById(id);
+  b.addEventListener("click", () => {
+    set(!get());
+    b.setAttribute("aria-pressed", String(get()));
+    b.innerHTML = label();
+  });
+}
+toggle("gr",   () => state.gr === 1,  v => state.gr = v ? 1 : 0,
+       () => state.gr ? "relativity on" : "relativity off");
+toggle("spin", () => state.spin < 0,  v => state.spin = v ? -1 : 1,
+       () => state.spin > 0 ? "disk &#8635;" : "disk &#8634;");
+toggle("anim", () => state.playing,   v => state.playing = v,
+       () => state.playing ? "animating" : "paused");
+
+document.getElementById("reset").addEventListener("click", () => {
+  state.r = DEF.r; state.incl = DEF.incl; state.az = DEF.az;
+});
+document.getElementById("shot").addEventListener("click", () => {
+  draw();                                   // fresh buffer, then capture
+  canvas.toBlob(b => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(b);
+    a.download = "black-hole.png";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }, "image/png");
+});
+window.addEventListener("resize", resize);
+</script>
+</body>
+</html>
